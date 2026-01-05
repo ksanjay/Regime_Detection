@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Market Regime Detection Platform</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.plot.ly/plotly-2.24.1.min.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: #f1f1f1; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #888; border-radius: 10px; }
+        body { background-color: #f8fafc; font-family: 'Inter', sans-serif; }
+        .animate-fade-in { animation: fadeIn 0.5s ease-out; }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useMemo, useRef } = React;
+
+        // --- INLINE SVG ICONS ---
+        const Icon = ({ children, size = 24, className = "" }) => (
+            <svg 
+                xmlns="http://www.w3.org/2000/svg" 
+                width={size} 
+                height={size} 
+                viewBox="0 0 24 24" 
+                fill="none" 
+                stroke="currentColor" 
+                strokeWidth="2" 
+                strokeLinecap="round" 
+                strokeLinejoin="round" 
+                className={className}
+            >
+                {children}
+            </svg>
+        );
+
+        const Icons = {
+            Upload: (props) => (
+                <Icon {...props}><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/></Icon>
+            ),
+            Settings2: (props) => (
+                <Icon {...props}><path d="M20 7h-9"/><path d="M14 17H5"/><circle cx="17" cy="17" r="3"/><circle cx="7" cy="7" r="3"/></Icon>
+            ),
+            BarChart3: (props) => (
+                <Icon {...props}><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></Icon>
+            ),
+            Activity: (props) => (
+                <Icon {...props}><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></Icon>
+            ),
+            AlertCircle: (props) => (
+                <Icon {...props}><circle cx="12" cy="12" r="10"/><line x1="12" x2="12" y1="8" y2="12"/><line x1="12" x2="12.01" y1="16" y2="16"/></Icon>
+            ),
+            Info: (props) => (
+                <Icon {...props}><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></Icon>
+            ),
+            Download: (props) => (
+                <Icon {...props}><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></Icon>
+            )
+        };
+
+        // --- MATH UTILITIES ---
+        
+        const getLogReturns = (prices) => {
+            const returns = [];
+            for (let i = 1; i < prices.length; i++) {
+                if (prices[i] <= 0 || prices[i-1] <= 0) continue;
+                returns.push(Math.log(prices[i] / prices[i - 1]));
+            }
+            return returns;
+        };
+
+        const calculateStats = (segment) => {
+            const n = segment.length;
+            if (n === 0) return { mean: 0, variance: 0 };
+            const mean = segment.reduce((a, b) => a + b, 0) / n;
+            const variance = segment.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / n;
+            return { mean, variance, std: Math.sqrt(variance) };
+        };
+
+        const getMedian = (values) => {
+            const sorted = [...values].sort((a, b) => a - b);
+            const mid = Math.floor(sorted.length / 2);
+            return sorted.length % 2 !== 0 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+        };
+
+        // --- WK-MEANS CORE ---
+
+        const runWKMeans = (measures, k, iterations = 25) => {
+            if (!measures || measures.length === 0) return { assignments: [], centroids: [] };
+            
+            let centroids = [];
+            const indices = new Set();
+            while (centroids.length < k && indices.size < measures.length) {
+                const idx = Math.floor(Math.random() * measures.length);
+                if (!indices.has(idx)) {
+                    indices.add(idx);
+                    centroids.push([...measures[idx].atoms]);
+                }
+            }
+
+            let assignments = new Array(measures.length).fill(0);
+
+            for (let iter = 0; iter < iterations; iter++) {
+                let changed = false;
+                
+                measures.forEach((measure, mIdx) => {
+                    let minDist = Infinity;
+                    let bestK = 0;
+
+                    centroids.forEach((centroid, kIdx) => {
+                        let dist = 0;
+                        for (let i = 0; i < measure.atoms.length; i++) {
+                            dist += Math.abs(measure.atoms[i] - centroid[i]);
+                        }
+                        dist /= measure.atoms.length;
+
+                        if (dist < minDist) {
+                            minDist = dist;
+                            bestK = kIdx;
+                        }
+                    });
+
+                    if (assignments[mIdx] !== bestK) {
+                        assignments[mIdx] = bestK;
+                        changed = true;
+                    }
+                });
+
+                if (!changed && iter > 0) break;
+
+                for (let kIdx = 0; kIdx < k; kIdx++) {
+                    const clusterMeasures = measures.filter((_, i) => assignments[i] === kIdx);
+                    if (clusterMeasures.length === 0) continue;
+
+                    const newAtoms = [];
+                    const numAtoms = measures[0].atoms.length;
+                    
+                    for (let atomIdx = 0; atomIdx < numAtoms; atomIdx++) {
+                        const atomValues = clusterMeasures.map(m => m.atoms[atomIdx]);
+                        newAtoms.push(getMedian(atomValues));
+                    }
+                    centroids[kIdx] = newAtoms;
+                }
+            }
+
+            return { assignments, centroids };
+        };
+
+        // --- COMPONENTS ---
+
+        const Plot = ({ data, layout, config, divId }) => {
+            useEffect(() => {
+                if (data && document.getElementById(divId)) {
+                    Plotly.newPlot(divId, data, layout, config);
+                }
+            }, [data, layout]);
+            return <div id={divId} className="w-full h-[450px]"></div>;
+        };
+
+        const App = () => {
+            const [data, setData] = useState(null);
+            const [params, setParams] = useState({ h1: 35, h2: 28, k: 2 });
+            const [results, setResults] = useState(null);
+            const [loading, setLoading] = useState(false);
+            const [activeTab, setActiveTab] = useState('overview');
+
+            const handleFileUpload = (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+
+                const reader = new FileReader();
+                reader.onload = (event) => {
+                    const text = event.target.result;
+                    const rows = text.split('\n').map(r => r.trim()).filter(r => r);
+                    const prices = [];
+                    const timestamps = [];
+                    
+                    rows.forEach(row => {
+                        const parts = row.split(',');
+                        if (parts.length >= 2) {
+                            // Logic: If standard OHLC (7 cols), use Adj Close (col 5) or Close (col 4).
+                            // Otherwise, default to col 1.
+                            let priceIdx = 1;
+                            if (parts.length >= 6) priceIdx = 4; // Close Price index
+                            
+                            const p = parseFloat(parts[priceIdx]);
+                            if (!isNaN(p)) {
+                                prices.push(p);
+                                timestamps.push(parts[0]);
+                            }
+                        }
+                    });
+                    
+                    if (prices.length > 0) {
+                        setData({ prices, timestamps });
+                    }
+                };
+                reader.readAsText(file);
+            };
+
+            const processRegimes = () => {
+                if (!data) return;
+                setLoading(true);
+                
+                setTimeout(() => {
+                    const returns = getLogReturns(data.prices);
+                    const { h1, h2, k } = params;
+                    
+                    if (returns.length < h1) {
+                        setLoading(false);
+                        return;
+                    }
+
+                    const measures = [];
+                    for (let i = 0; i <= returns.length - h1; i += h2) {
+                        const segment = returns.slice(i, i + h1);
+                        const sortedAtoms = [...segment].sort((a, b) => a - b);
+                        const stats = calculateStats(segment);
+                        measures.push({
+                            startIndex: i,
+                            endIndex: i + h1,
+                            atoms: sortedAtoms,
+                            mean: stats.mean,
+                            variance: stats.variance
+                        });
+                    }
+
+                    const { assignments, centroids } = runWKMeans(measures, k);
+                    const regimeColors = ['#22c55e', '#ef4444', '#3b82f6', '#eab308'];
+                    
+                    setResults({
+                        measures,
+                        assignments,
+                        centroids,
+                        regimeColors
+                    });
+                    setLoading(false);
+                }, 100);
+            };
+
+            const priceChartData = useMemo(() => {
+                if (!data || !results) return null;
+                
+                const traces = [{
+                    x: data.timestamps.slice(1),
+                    y: data.prices.slice(1),
+                    type: 'scatter',
+                    mode: 'lines',
+                    line: { color: '#475569', width: 2 },
+                    name: 'Price'
+                }];
+
+                const shapes = results.measures.map((m, i) => ({
+                    type: 'rect',
+                    xref: 'x',
+                    yref: 'paper',
+                    x0: data.timestamps[m.startIndex + 1],
+                    x1: data.timestamps[m.endIndex + 1],
+                    y0: 0,
+                    y1: 1,
+                    fillcolor: results.regimeColors[results.assignments[i]],
+                    opacity: 0.15,
+                    line: { width: 0 }
+                }));
+
+                return { traces, shapes };
+            }, [data, results]);
+
+            const scatterData = useMemo(() => {
+                if (!results) return null;
+                return results.regimeColors.slice(0, params.k).map((color, kIdx) => {
+                    const clusterPoints = results.measures.filter((_, i) => results.assignments[i] === kIdx);
+                    return {
+                        x: clusterPoints.map(m => m.variance),
+                        y: clusterPoints.map(m => m.mean),
+                        mode: 'markers',
+                        type: 'scatter',
+                        name: `Regime ${kIdx + 1}`,
+                        marker: { color, size: 8, opacity: 0.7 }
+                    };
+                });
+            }, [results, params.k]);
+
+            return (
+                <div className="min-h-screen flex flex-col">
+                    <header className="bg-white border-b border-slate-200 px-6 py-4 flex flex-wrap justify-between items-center sticky top-0 z-50">
+                        <div className="flex items-center gap-2 mb-2 sm:mb-0">
+                            <div className="bg-indigo-600 p-2 rounded-lg text-white">
+                                <Icons.Activity size={24} />
+                            </div>
+                            <div>
+                                <h1 className="text-xl font-bold text-slate-800 leading-none">RegimeHub</h1>
+                                <span className="text-[10px] text-slate-400 font-medium uppercase tracking-wider">Wasserstein Analysis</span>
+                            </div>
+                        </div>
+                        <div className="flex items-center gap-3">
+                            <input 
+                                type="file" id="csv-upload" className="hidden" accept=".csv"
+                                onChange={handleFileUpload}
+                            />
+                            <label 
+                                htmlFor="csv-upload"
+                                className="flex items-center gap-2 px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg cursor-pointer transition-colors text-sm font-medium"
+                            >
+                                <Icons.Upload size={16} />
+                                <span className="hidden sm:inline">Load Dataset</span>
+                            </label>
+                            <button 
+                                onClick={processRegimes}
+                                disabled={!data || loading}
+                                className={`px-6 py-2 rounded-lg font-medium transition-all text-sm ${!data || loading ? 'bg-slate-300 cursor-not-allowed text-slate-500' : 'bg-indigo-600 hover:bg-indigo-700 text-white shadow-lg shadow-indigo-200'}`}
+                            >
+                                {loading ? 'Clustering...' : 'Detect Regimes'}
+                            </button>
+                        </div>
+                    </header>
+
+                    <main className="flex-1 p-4 lg:p-6 grid grid-cols-12 gap-6 max-w-[1600px] mx-auto w-full">
+                        <aside className="col-span-12 lg:col-span-3 space-y-6">
+                            <section className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
+                                <div className="flex items-center gap-2 mb-4 text-slate-800 font-semibold border-b border-slate-100 pb-2">
+                                    <Icons.Settings2 size={18} />
+                                    <h2>Hyperparameters</h2>
+                                </div>
+                                <div className="space-y-6">
+                                    <div>
+                                        <div className="flex justify-between text-xs font-bold text-slate-400 uppercase mb-2">
+                                            <label>Window Length (h1)</label>
+                                            <span className="text-indigo-600">{params.h1}</span>
+                                        </div>
+                                        <input 
+                                            type="range" min="10" max="100" value={params.h1}
+                                            onChange={(e) => setParams({...params, h1: parseInt(e.target.value)})}
+                                            className="w-full h-1.5 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-indigo-600"
+                                        />
+                                    </div>
+                                    <div>
+                                        <div className="flex justify-between text-xs font-bold text-slate-400 uppercase mb-2">
+                                            <label>Stride Offset (h2)</label>
+                                            <span className="text-indigo-600">{params.h2}</span>
+                                        </div>
+                                        <input 
+                                            type="range" min="5" max="50" value={params.h2}
+                                            onChange={(e) => setParams({...params, h2: parseInt(e.target.value)})}
+                                            className="w-full h-1.5 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-indigo-600"
+                                        />
+                                    </div>
+                                    <div>
+                                        <div className="flex justify-between text-xs font-bold text-slate-400 uppercase mb-2">
+                                            <label>Cluster Count (k)</label>
+                                            <span className="text-indigo-600">{params.k}</span>
+                                        </div>
+                                        <input 
+                                            type="range" min="2" max="4" value={params.k}
+                                            onChange={(e) => setParams({...params, k: parseInt(e.target.value)})}
+                                            className="w-full h-1.5 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-indigo-600"
+                                        />
+                                    </div>
+                                </div>
+                            </section>
+
+                            <section className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
+                                <div className="flex items-center gap-2 mb-3 text-slate-800 font-semibold border-b border-slate-100 pb-2">
+                                    <Icons.Info size={18} />
+                                    <h2>Methodology</h2>
+                                </div>
+                                <p className="text-xs text-slate-500 leading-relaxed mb-4">
+                                    The algorithm maps each temporal window into the space of probability measures. Optimal transport distances (Wasserstein) are used to cluster these measures without assuming normal distribution of returns.
+                                </p>
+                                <div className="p-3 bg-indigo-50 border border-indigo-100 rounded-lg">
+                                    <div className="flex items-center gap-2 text-indigo-700 text-[10px] font-bold uppercase mb-1">
+                                        <Icons.AlertCircle size={12} />
+                                        <span>Data Status</span>
+                                    </div>
+                                    <p className="text-xs text-indigo-900">
+                                        {data ? `${data.prices.length} observations loaded.` : "Awaiting CSV input."}
+                                    </p>
+                                </div>
+                            </section>
+                        </aside>
+
+                        <div className="col-span-12 lg:col-span-9 space-y-6">
+                            {!results ? (
+                                <div className="bg-white border-2 border-dashed border-slate-200 rounded-2xl h-[500px] flex flex-col items-center justify-center text-slate-400">
+                                    <Icons.BarChart3 size={64} className="mb-4 opacity-10" />
+                                    <p className="text-lg font-medium">Ready for Market Analysis</p>
+                                    <p className="text-sm">Please upload a historical price CSV to detect regimes</p>
+                                </div>
+                            ) : (
+                                <>
+                                    <div className="flex flex-wrap gap-1 bg-slate-100 p-1 rounded-xl w-fit">
+                                        <button 
+                                            onClick={() => setActiveTab('overview')}
+                                            className={`py-2 px-6 rounded-lg font-semibold text-sm transition-all ${activeTab === 'overview' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-500 hover:text-slate-800'}`}
+                                        >
+                                            Regime Overlay
+                                        </button>
+                                        <button 
+                                            onClick={() => setActiveTab('analysis')}
+                                            className={`py-2 px-6 rounded-lg font-semibold text-sm transition-all ${activeTab === 'analysis' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-500 hover:text-slate-800'}`}
+                                        >
+                                            Feature Space
+                                        </button>
+                                    </div>
+
+                                    {activeTab === 'overview' ? (
+                                        <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm animate-fade-in">
+                                            <div className="flex flex-wrap justify-between items-center mb-6 gap-4">
+                                                <h3 className="text-lg font-bold text-slate-800">Historical States</h3>
+                                                <div className="flex flex-wrap gap-4">
+                                                    {results.regimeColors.slice(0, params.k).map((color, i) => (
+                                                        <div key={i} className="flex items-center gap-2 bg-slate-50 px-3 py-1 rounded-full border border-slate-100">
+                                                            <div className="w-2.5 h-2.5 rounded-full" style={{backgroundColor: color}}></div>
+                                                            <span className="text-[10px] text-slate-600 font-bold uppercase tracking-tight">Regime {i+1}</span>
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                            <Plot 
+                                                divId="pricePlot"
+                                                data={priceChartData.traces}
+                                                layout={{
+                                                    margin: { t: 10, r: 10, b: 40, l: 60 },
+                                                    xaxis: { gridcolor: '#f1f5f9', zeroline: false },
+                                                    yaxis: { gridcolor: '#f1f5f9', title: 'Asset Price', zeroline: false },
+                                                    shapes: priceChartData.shapes,
+                                                    showlegend: false,
+                                                    autosize: true,
+                                                    font: { family: 'Inter, sans-serif' }
+                                                }}
+                                                config={{ responsive: true, displayModeBar: false }}
+                                            />
+                                        </div>
+                                    ) : (
+                                        <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm animate-fade-in">
+                                            <h3 className="text-lg font-bold text-slate-800 mb-6">Mean-Variance Distribution</h3>
+                                            <Plot 
+                                                divId="scatterPlot"
+                                                data={scatterData}
+                                                layout={{
+                                                    margin: { t: 10, r: 10, b: 40, l: 60 },
+                                                    xaxis: { title: 'Variance (Risk)', gridcolor: '#f1f5f9', zeroline: false },
+                                                    yaxis: { title: 'Mean Return', gridcolor: '#f1f5f9', zeroline: false },
+                                                    hovermode: 'closest',
+                                                    autosize: true,
+                                                    font: { family: 'Inter, sans-serif' }
+                                                }}
+                                                config={{ responsive: true, displayModeBar: false }}
+                                            />
+                                            <div className="mt-8 grid grid-cols-2 sm:grid-cols-4 gap-4">
+                                                {results.regimeColors.slice(0, params.k).map((_, i) => {
+                                                    const count = results.assignments.filter(a => a === i).length;
+                                                    const percentage = ((count / results.assignments.length) * 100).toFixed(1);
+                                                    return (
+                                                        <div key={i} className="bg-slate-50 p-4 rounded-xl border border-slate-100">
+                                                            <p className="text-[10px] uppercase tracking-widest text-slate-400 font-bold mb-1">State {i+1} Occurrence</p>
+                                                            <div className="flex items-baseline gap-1">
+                                                                <span className="text-2xl font-bold text-slate-800">{count}</span>
+                                                                <span className="text-xs text-slate-500 font-medium">({percentage}%)</span>
+                                                            </div>
+                                                        </div>
+                                                    );
+                                                })}
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    <div className="bg-indigo-950 text-white p-8 rounded-3xl shadow-2xl relative overflow-hidden group">
+                                        <div className="absolute -right-20 -top-20 w-64 h-64 bg-indigo-800 rounded-full opacity-20 blur-3xl group-hover:scale-110 transition-transform duration-700"></div>
+                                        <div className="relative z-10 flex flex-col sm:flex-row items-center justify-between gap-6">
+                                            <div>
+                                                <p className="text-indigo-400 text-xs font-bold mb-2 uppercase tracking-[0.2em]">Latest Detection</p>
+                                                <div className="flex items-center gap-4">
+                                                    <div className="w-5 h-5 rounded-full shadow-[0_0_15px_rgba(255,255,255,0.3)] animate-pulse" 
+                                                         style={{backgroundColor: results.regimeColors[results.assignments[results.assignments.length-1]]}}></div>
+                                                    <h2 className="text-3xl font-black tracking-tight">
+                                                        Market State: Regime {results.assignments[results.assignments.length-1] + 1}
+                                                    </h2>
+                                                </div>
+                                            </div>
+                                            <div className="text-center sm:text-right border-t sm:border-t-0 sm:border-l border-indigo-800 pt-6 sm:pt-0 sm:pl-8">
+                                                <p className="text-indigo-400 text-[10px] font-bold mb-1 uppercase tracking-wider">Predictive Horizon</p>
+                                                <p className="font-mono text-xl font-bold">~{params.h2} Steps</p>
+                                                <span className="text-[10px] text-indigo-500">Until Stride Completion</span>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </>
+                            )}
+                        </div>
+                    </main>
+                    <footer className="p-6 text-center text-slate-400 text-[10px] font-medium uppercase tracking-[0.3em]">
+                        Non-Parametric Market Regime Classification &copy; 2026
+                    </footer>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
